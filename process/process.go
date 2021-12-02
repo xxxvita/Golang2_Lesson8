@@ -31,6 +31,8 @@ import (
 type FindDuplicate struct {
 	DirName  string
 	FileName string
+	FileSize int64
+	workerId uint16
 }
 
 type ChanFindDuplicate chan FindDuplicate
@@ -38,9 +40,112 @@ type ChanFindDuplicate chan FindDuplicate
 // Настройки поведения для процесса анализа дубликатов
 type Options struct {
 	// true если требуется подтверждение перед удалением файла
-	MustConfirmationDelete bool
+	mustConfirmationDelete bool
 	// true если требуется удалять файлы-дубликаты
-	NeedRemoveDuplicate bool
+	needRemoveDuplicate bool
+	// Максимальное число потоков, анализируюбщие директории
+	// -1 - бесконечное число потоков
+	maxCountThread int16
+	// Текущее число работабщих потоков, анализирующие директории
+	currentThreadCount int16
+	// Защита доступа к данным структуры из горутин
+	mux sync.RWMutex
+}
+
+// Получение экземпляра указателя на структуру с настройками по умолчанию
+func OptionsNew() *Options {
+	return &Options{
+		mustConfirmationDelete: true,
+		needRemoveDuplicate:    false,
+		maxCountThread:         -1,
+		mux:                    sync.RWMutex{},
+	}
+}
+
+// Сеттер для MustConfirmationDelete
+func (o *Options) MustConfirmationDeleteSet(val bool) {
+	o.mux.Lock()
+	defer o.mux.Unlock()
+
+	o.mustConfirmationDelete = val
+}
+
+// Геттер для MustConfirmationDelete
+func (o *Options) MustConfirmationDeleteGet() bool {
+	o.mux.RLock()
+	defer o.mux.RUnlock()
+
+	return o.mustConfirmationDelete
+}
+
+// Сеттер для needRemoveDuplicate
+func (o *Options) NeedRemoveDuplicateSet(val bool) {
+	o.mux.Lock()
+	defer o.mux.Unlock()
+
+	o.needRemoveDuplicate = val
+}
+
+// Геттер для needRemoveDuplicate
+func (o *Options) NeedRemoveDuplicateGet() bool {
+	o.mux.RLock()
+	defer o.mux.RUnlock()
+
+	return o.needRemoveDuplicate
+}
+
+// Геттер для maxCountThread
+func (o *Options) MaxCountThreadGet() int16 {
+	o.mux.RLock()
+	defer o.mux.RUnlock()
+
+	return o.maxCountThread
+}
+
+// Сеттер для maxCountThread
+func (o *Options) MaxCountThreadSet(val int16) {
+	o.mux.Lock()
+	defer o.mux.Unlock()
+
+	o.maxCountThread = val
+}
+
+// Геттер для currentThreadCount
+func (o *Options) CurrentThreadCountGet() int16 {
+	o.mux.RLock()
+	defer o.mux.RUnlock()
+
+	return o.currentThreadCount
+}
+
+// Сеттер для currentThreadCount
+func (o *Options) CurrentThreadCountSet(val int16) {
+	o.mux.Lock()
+	defer o.mux.Unlock()
+
+	o.currentThreadCount = val
+}
+
+// Если возможно добавить поток-воркер (currentThreadCount < MaxCountThread),
+// то добавляется новая горутина и функция возвращает true, иначе возвращает false
+func (o *Options) AddWorker() bool {
+	o.mux.Lock()
+	defer o.mux.Unlock()
+
+	if o.maxCountThread == -1 || o.currentThreadCount < o.maxCountThread {
+		o.currentThreadCount++
+		return true
+	}
+
+	return false
+}
+
+// Уменьшение числа текущих потоков
+func (o *Options) RemoveWorker() {
+	o.mux.Lock()
+	defer o.mux.Unlock()
+
+	o.currentThreadCount--
 }
 
 // Анализ файлов из канала на предмет дубликата
@@ -48,32 +153,33 @@ type Options struct {
 // в канкле сh передаётся структура с указанием директории, которая сейчас обрабатывается,
 // если в options.MustConfirmationDelete == true или указывается название файла,
 // совместно с директорией для дальнейшего анализа на дубликаты.
-func StartDuplicateFind(options Options, ch <-chan FindDuplicate, wg *sync.WaitGroup) {
+func StartDuplicateFind(options *Options, ch <-chan FindDuplicate, wg *sync.WaitGroup) {
 	log.Println("Старт поиска дубликатов...")
 	defer wg.Done()
 	defer log.Println("Поиск дубликатов прекращён")
 
-	mapFiles := map[string]int{}
+	mapFiles := map[string]struct{}{}
 
 	for fd := range ch {
 		// Если требуется прерывания на согласие пользователя ,
 		// то в канале log-строка с текущим каталогом перед его обработкой
-		if options.MustConfirmationDelete && fd.FileName == "" {
-			log.Printf("Обработка каталога: %s", fd.DirName)
+		if options.MustConfirmationDeleteGet() && fd.FileName == "" {
+			log.Printf("Обработка каталога (workerId: %d): %s", fd.workerId, fd.DirName)
 			continue
 		}
 
 		log.Printf("Найден файл: %s\n", fd.DirName+"/"+fd.FileName)
 
-		// Если файл fd.FileName уже есть в списке, то это дубликат
-		_, ok := mapFiles[fd.FileName]
+		// Если файл fd.FileName + fd.Size уже есть в списке, то это дубликат
+		sMapKey := fmt.Sprintf("%s_%d", fd.FileName, fd.FileSize)
+		_, ok := mapFiles[sMapKey]
 		// Почему-то запись if _, ok := mapFiles[fd.FileName] ругается на знак подчёркивания
 		if ok {
-			log.Printf("Найден дубликат. Файл: %s\n", fd.DirName+"/"+fd.FileName)
+			log.Printf("Найден дубликат. Файл: %s (size: %d)\n", fd.DirName+"/"+fd.FileName, fd.FileSize)
 
 			// Ожидание ввода пользователя
-			if options.MustConfirmationDelete && options.NeedRemoveDuplicate {
-				fmt.Printf("Удалить файл %s? (y, n)", fd.DirName+"/"+fd.FileName)
+			if options.MustConfirmationDeleteGet() && options.NeedRemoveDuplicateGet() {
+				fmt.Printf("Удалить файл %s (size: %d)? (y, n)", fd.DirName+"/"+fd.FileName, fd.FileSize)
 				scanner := bufio.NewScanner(os.Stdin)
 				fl := true
 				for fl {
@@ -91,7 +197,7 @@ func StartDuplicateFind(options Options, ch <-chan FindDuplicate, wg *sync.WaitG
 								fl = false
 							}
 						default:
-							fmt.Printf("\nНеверный ввод. Повторите (y/n):")
+							fmt.Printf("Неверный ввод. Повторите (y/n):")
 						}
 
 						break
@@ -101,14 +207,14 @@ func StartDuplicateFind(options Options, ch <-chan FindDuplicate, wg *sync.WaitG
 				fmt.Printf("Файл %s удалён!\n", fd.DirName+"/"+fd.FileName)
 			}
 		} else {
-			mapFiles[fd.FileName] = 1
+			mapFiles[sMapKey] = struct{}{}
 		}
 	}
 }
 
 // Обход дерева директорий с созданием для каждой поддиректории,
 // включая заданную потока для отслеживания файлов-дубликатов
-func StartWatch(options Options, fDir *os.File, wg *sync.WaitGroup) error {
+func StartWatch(options *Options, fDir *os.File, wg *sync.WaitGroup) error {
 	// Запуск слежения за дубликатами в каталогах
 
 	chanDupl := make(ChanFindDuplicate)
@@ -119,7 +225,12 @@ func StartWatch(options Options, fDir *os.File, wg *sync.WaitGroup) error {
 
 	wg.Add(1)
 	go func() {
-		StartContentChanges(options, fDir, wg, &chanDupl)
+		// Первый поток
+		options.CurrentThreadCountSet(1)
+		err := StartContentChanges(options, fDir, wg, &chanDupl, 1)
+		if err != nil {
+			log.Fatal(err)
+		}
 
 		defer wg.Done()
 	}()
@@ -136,25 +247,25 @@ func StartWatch(options Options, fDir *os.File, wg *sync.WaitGroup) error {
 }
 
 // Запуск потока для отслеживания изменений в директории
-func StartContentChanges(options Options, sDir *os.File, wg *sync.WaitGroup, signalChan *ChanFindDuplicate) {
+func StartContentChanges(options *Options, sDir *os.File, wg *sync.WaitGroup, signalChan *ChanFindDuplicate, idWorker uint16) error {
 	// Отправка сообщения "Обработка каталога" в поток анализа файлов
 	// если требуется подтверждение от пользователя
-	if options.MustConfirmationDelete {
+	if options.MustConfirmationDeleteGet() {
 		*signalChan <- FindDuplicate{DirName: sDir.Name()}
 	} else {
-		log.Printf("Обработка каталога: %s", sDir.Name())
+		log.Printf("Обработка каталога (workerId:%d): %s", idWorker, sDir.Name())
 	}
 
 	fileNames, err := sDir.Readdirnames(-1)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("ошибка чтения каталога %s: %s", sDir.Name(), err)
 	}
 
-	// Анализируем содержимое директоии (файл и директоии)
+	// Анализируем содержимое директории (файл и директории)
 	for _, s := range fileNames {
 		st, err := os.Stat(sDir.Name() + "/" + s)
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("ошибка получения информации о файле в каталоге %s: %s", sDir.Name(), err)
 		}
 
 		// Для каждого нового каталога запускается свой поток обработки
@@ -163,18 +274,26 @@ func StartContentChanges(options Options, sDir *os.File, wg *sync.WaitGroup, sig
 
 			f, err := os.Open(sCatalogName)
 			if err != nil {
-				log.Printf("Ошибка чтения каталога (%s): %s\n", sCatalogName, err)
+				return fmt.Errorf("ошибка чтения каталога %s: %s", sCatalogName, err)
 			}
 
-			wg.Add(1)
-			go func() {
-				StartContentChanges(options, f, wg, signalChan)
+			// Если можно запустить воркер для анализа директории
+			if options.AddWorker() {
+				wg.Add(1)
+				go func() {
+					StartContentChanges(options, f, wg, signalChan, idWorker+1)
 
-				defer wg.Done()
-			}()
+					defer wg.Done()
+					defer options.RemoveWorker()
+				}()
+			} else {
+				StartContentChanges(options, f, wg, signalChan, idWorker)
+			}
 		} else {
 			// Отправка найденного файла в канал для его дальнейшего анализа
-			*signalChan <- FindDuplicate{DirName: sDir.Name(), FileName: st.Name()}
+			*signalChan <- FindDuplicate{DirName: sDir.Name(), FileName: st.Name(), FileSize: st.Size()}
 		}
 	}
+
+	return nil
 }

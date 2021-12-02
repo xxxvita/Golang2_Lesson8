@@ -37,10 +37,11 @@ func main() {
 
 	// Запуск обхода указанной директории
 	wg := sync.WaitGroup{}
-	options := process.Options{}
+	options := process.OptionsNew()
 
-	options.MustConfirmationDelete = !*flagA
-	options.NeedRemoveDuplicate = *flagR
+	options.MustConfirmationDeleteSet(!*flagA)
+	options.NeedRemoveDuplicateSet(*flagR)
+	options.MaxCountThreadSet(1)
 
 	err = process.StartWatch(options, fDir, &wg)
 	if err != nil {
